@@ -16,7 +16,7 @@ def multitask_sample(policies, env_specs, horizon, stochastic):
 
     Returns: a list of dictionaries of sample data, list is over tasks
     """
-    return ray.get([singletask_sample.remote(policy, spec, horizon, stochastic) for env, spec in zip(policies, env_specs)])
+    return ray.get([singletask_sample.remote(policy, spec, horizon, stochastic) for policy, spec in zip(policies, env_specs)])
 
 
 @ray.remote
