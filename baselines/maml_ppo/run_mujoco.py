@@ -29,18 +29,16 @@ def train(env_id, num_timesteps, seed):
     policy = MlpPolicy
     ray.init()
     maml_ppo.learn(policy=policy, get_env=get_env, nsteps=2048, nminibatches=64,
-        lam=0.95, gamma=0.99, noptepochs=10, log_interval=1,
-        ent_coef=0.0,
-        lr=3e-4,
+        lam=0.95, gamma=0.99, noptepochs=10, log_interval=1, ent_coef=0.0,
+        lr=3e-4, inner_lr=0.1,
         cliprange=0.2,
-        inner_lr=0.0,
-        ntasks=2,
+        ntasks=4,
         total_timesteps=num_timesteps)
 
 
 def main():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument('--env', help='environment ID', default='Hopper-v1')
+    parser.add_argument('--env', help='environment ID', default='HalfCheetahGoalVel-v0')
     parser.add_argument('--seed', help='RNG seed', type=int, default=0)
     parser.add_argument('--num-timesteps', type=int, default=int(1e6))
     args = parser.parse_args()

@@ -62,6 +62,9 @@ class Model(object):
             train_neglogpac = pre_pd.neglogp(T_A)
             ratio = tf.exp(T_OLDNEGLOGPAC - train_neglogpac)
             pg_loss = tf.reduce_mean(-T_ADV * ratio)
+            # remove next two lines to not use clipping
+            #pg_losses2 = -T_ADV * tf.clip_by_value(ratio, 1.0 - CLIPRANGE, 1.0 + CLIPRANGE)
+            #pg_loss = tf.reduce_mean(tf.maximum(pg_loss, pg_losses2))
             inner_grad = tf.gradients(pg_loss, init_weights_list)
 
             gradients = dict(zip(weight_keys, inner_grad))
@@ -110,13 +113,13 @@ class Model(object):
             weights_list = sess.run(init_weights_list)
             return dict(zip(weight_keys, weights_list))
 
-        def get_updated_weights(obs, returns, actions, values, neglogpacs):
+        def get_updated_weights(cliprange, obs, returns, actions, values, neglogpacs):
             """ Return list of weight matrices. """
             advs = returns - values
             # TODO - should do the below on a per-task basis, make sure advs is numtasks x T
             assert advs.shape[0] == ntasks and advs.shape[1] == nbatch_pre
             advs = (advs - advs.mean(axis=1,keepdims=True)) / (advs.std(axis=1,keepdims=True) + 1e-8)
-            td_map = {TRAIN_X:obs, TRAIN_A:actions, TRAIN_ADV:advs, TRAIN_OLDNEGLOGPAC:neglogpacs}
+            td_map = {CLIPRANGE:cliprange, TRAIN_X:obs, TRAIN_A:actions, TRAIN_ADV:advs, TRAIN_OLDNEGLOGPAC:neglogpacs}
             new_weights = sess.run(new_task_weights, td_map)
             weight_dicts = []
             for i in range(ntasks):
@@ -228,14 +231,16 @@ def learn(*, policy, get_env, ntasks, nsteps, total_timesteps, ent_coef, lr, inn
         lrnow = lr(frac)
         cliprangenow = cliprange(frac)
 
-        # No task resetting for now. (during initial testing period)
-        #for runner in runners:
-        #    # sample a new batch of tasks
-        #    runner.reset_task.remote()
+        # sample a new batch of tasks
+        for runner in runners:
+            runner.reset_task.remote()
 
+        t0 = time.time()
         # gather pre-update data
         preupdate_weights = model.get_preupdate_weights()
         pre_sampling_data = ray.get([runner.run.remote(preupdate_weights) for runner in runners])
+        diff = time.time() - t0
+        print('Pre sampling time: ' + str(diff))
         #pre_sampling_data = [runner.run(preupdate_weights) for runner in runners]
 
         # invert list of lists and pack data of new inner list into first dim
@@ -243,18 +248,27 @@ def learn(*, policy, get_env, ntasks, nsteps, total_timesteps, ent_coef, lr, inn
         pre_obs, pre_returns, pre_actions, pre_values, pre_neglogpacs, _, pre_epinfos = pre_data
 
         # compute updated weights.
-        updated_weights = model.get_updated_weights(pre_obs, pre_returns,
+        t0 = time.time()
+        updated_weights = model.get_updated_weights(cliprange(1.0), pre_obs, pre_returns,
                                                     pre_actions, pre_values, pre_neglogpacs)
+        diff = time.time() - t0
+        print("Compute theta' time: " + str(diff))
 
         # gather post-update data
+        t0 = time.time()
         post_sampling_data = ray.get([runner.run.remote(weights) for runner, weights in zip(runners, updated_weights)])
         #post_sampling_data = [runner.run(weights) for runner, weights in zip(runners, updated_weights)]
         post_data = [ np.array([task_data[i] for task_data in post_sampling_data]) for i in range(len(post_sampling_data[0])) ]
         post_obs, post_returns, post_actions, post_values, post_neglogpacs, _, post_epinfos = post_data
 
+        diff1 = time.time() - t0
+        print("Post sampling time: " + str(diff1))
+
+
         pre_epinfobuf.extend(pre_epinfos)
         post_epinfobuf.extend(post_epinfos)
         mblossvals = []
+        t0 = time.time()
         if states is None: # nonrecurrent version
             inds = np.arange(nbatch)
             for _ in range(noptepochs):
@@ -268,6 +282,8 @@ def learn(*, policy, get_env, ntasks, nsteps, total_timesteps, ent_coef, lr, inn
                     mblossvals.append(model.train(lrnow, cliprangenow,*pre_slices, *post_slices))
         else: # recurrent version
             raise NotImplementedError('Recurrence not currently supported with MAML')
+        diff = time.time() - t0
+        print("Meta optimization time: " + str(diff))
         lossvals = np.mean(mblossvals, axis=0)
         tnow = time.time()
         fps = int(nbatch / (tnow - tstart))

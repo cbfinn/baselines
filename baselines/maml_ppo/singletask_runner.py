@@ -53,7 +53,8 @@ class SingleTaskRunner(object):
 
     def reset_task(self):
         # TODO - make sure that if env is a vec env, the model is reset to be the same for all envs
-        self.env.reset_model()
+        assert len(self.env.venv.envs) == 1 # for now, only supporting 1 env.
+        self.env.venv.envs[0].unwrapped.reset_task()
 
     def run(self, pol_weights):
         # obs, returns, actions, values, neglogpacs = runner.run()
