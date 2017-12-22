@@ -6,49 +6,58 @@ import tensorflow as tf
 @ray.remote
 class SingleTaskRunner(object):
 
-    def __init__(self, *, env, policy, nsteps, gamma, lam, vf_lr=5e-4, max_grad_norm=None):
+    def __init__(self, get_env, make_policy, nsteps, gamma, lam, vf_lr=5e-4, max_grad_norm=None,
+            nbatch_train=None, nbatch=None, noptepochs=None):
         self.sess = tf.Session()
 
-        self.env = env
-        self.policy = policy
+        self.env = env = get_env()
+        self.policy = make_policy()
         nenv = env.num_envs
-        self.obs = np.zeros((nenv,) + env.observation_space.shape, dtype=policy.X.dtype.name)
+        self.obs = np.zeros((nenv,) + env.observation_space.shape, dtype=self.policy.X.dtype.name)
         self.obs[:] = env.reset()
         self.gamma = gamma
         self.lam = lam
         self.nsteps = nsteps
-        self.states = policy.initial_state
+        self.noptepochs = noptepochs
+        self.nbatch = nbatch
+        self.nbatch_train = nbatch_train
+        self.states = self.policy.initial_state
         self.dones = [False for _ in range(nenv)]
 
         # form optimizer for training the value function, omitting code with OLDVPRED, since tasks
         # are not consistent across meta-batches.
         R = tf.placeholder(tf.float32, [None])
-        vpred = policy.vf
+        A = self.policy.pdtype.sample_placeholder([None])
+        ADV = tf.placeholder(tf.float32, [None])
+        vpred = self.policy.vf
         vf_losses1 = tf.square(vpred - R)
         vf_loss = .5 * tf.reduce_mean(vf_losses1)
         vf_params = self.policy.vf_weights
-        vf_grads = tf.gradients(vf_loss, vf_params)
-        if max_grad_norm is not None:  # TODO - pass this in.
+        vf_keys = vf_params.keys()
+        vf_params_list = [vf_params[key] for key in vf_keys]
+        vf_grads = tf.gradients(vf_loss, vf_params_list)
+        if max_grad_norm is not None:
             vf_grads, _vf_grad_norm = tf.clip_by_global_norm(vf_grads, max_grad_norm)
-        vf_grads = list(zip(vf_grads, vf_params))
+        vf_grads = list(zip(vf_grads, vf_params_list))
         vf_trainer = tf.train.AdamOptimizer(learning_rate=vf_lr, epsilon=1e-5)
         _vf_train = vf_trainer.apply_gradients(vf_grads)
 
         def vf_train(obs, returns, actions, values):
             advs = returns - values
             advs = (advs - advs.mean()) / (advs.std() + 1e-8)
-            td_map = {train_model.X:obs, A:actions, ADV:advs, R:returns}
-            return sess.run([vf_loss, _vf_train], td_map)[:-1]
+            td_map = {self.policy.X:obs, A:actions, ADV:advs, R:returns}
+            return self.sess.run([vf_loss, _vf_train], td_map)[:-1]
 
         self.vf_train = vf_train
+        tf.global_variables_initializer().run(session=self.sess) #pylint: disable=E1101
 
     def reset_task(self):
         # TODO - make sure that if env is a vec env, the model is reset to be the same for all envs
         self.env.reset_model()
 
-    def run(self, pol_weights, lrnow=None, cliprangenow=None, noptepochs=None, nbatch_train=None, nbatch=None):
+    def run(self, pol_weights):
         # obs, returns, actions, values, neglogpacs = runner.run()
-        self.policy.assign_sampling_weights(pol_weights)
+        self.policy.assign_sampling_weights(pol_weights, self.sess)
 
         mb_obs, mb_rewards, mb_actions, mb_values, mb_dones, mb_neglogpacs = [],[],[],[],[],[]
         mb_states = self.states
@@ -88,19 +97,19 @@ class SingleTaskRunner(object):
             mb_returns[t] = lastreturn
 
         # fit value function to returns
-        inds = np.arange(nbatch)
+        inds = np.arange(self.nbatch)
         obs, returns, actions, values, neglogpacs = tuple(map(sf01, (mb_obs, mb_returns, mb_actions, mb_values, mb_neglogpacs)))
-        for _ in range(noptepochs):
+        for _ in range(self.noptepochs):
             np.random.shuffle(inds)
-            for start in range(0, nbatch, nbatch_train):
-                end = start + nbatch_train
+            for start in range(0, self.nbatch, self.nbatch_train):
+                end = start + self.nbatch_train
                 mbinds = inds[start:end]
                 slices = (arr[mbinds] for arr in (obs, returns, actions, values))
-                vf_train(*slices)
+                self.vf_train(*slices)
         # done fitting value function, record new values
         mb_values = []
         for t in range(self.nsteps):
-            _, values, _, _ = self.policy.step(obs_list[t], None, mb_dones[t])
+            _, values, _, _ = self.policy.step(obs_list[t], self.sess, None, mb_dones[t])
             mb_values.append(values)
         mb_values = np.asarray(mb_values, dtype=np.float32)
         # done recording new values.

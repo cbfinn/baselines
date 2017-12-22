@@ -12,31 +12,33 @@ class MlpPolicy(object):
             weights: weights to be used, if another policy has already been constructed.
             sampling_pol: If True, then this policy is for sampling only.
         """
-        ob_shape = (nbatch,) + ob_space.shape
+        # TODO - don't make vf weights if sampling pol is false
+        self.ob_shape = (nbatch,) + ob_space.shape
         self.actdim = ac_space.shape[0]
+        self.pdtype = make_pdtype(ac_space)
 
         self.pol_weights, self.vf_weights = self.construct_weights()
 
         if sampling_pol:
-            self.X = tf.placeholder(tf.float32, ob_shape, name='Ob') #obs
+            self.X = tf.placeholder(tf.float32, (None,) + ob_space.shape, name='Ob') #obs
 
-            # placeholders and assign ops for assigning weights
-            self.weight_placeholders = {key: tf.placeholder(self.pol_weights[key].get_shape()) for key in self.weights}
+            # placeholders and assign ops for assigning policy weights
+            #self.weight_placeholders = {key: tf.placeholder(self.pol_weights[key].get_shape()) for key in self.pol_weights}
+            self.weight_placeholders = {key: tf.placeholder(tf.float32, shape=self.pol_weights[key].get_shape()) for key in self.pol_weights}
             self.assign_weight_ops = [tf.assign(self.pol_weights[key], self.weight_placeholders[key]) for key in self.pol_weights]
-            self.pi, logstd = self.forward_pol(X, self.pol_weights)
-            self.vf = self.forward_vf(X, self.vf_weights)
-            self.pdtype = make_pdtype(ac_space)
+            self.pi, logstd = self.forward_pol(self.X, self.pol_weights)
+            self.vf = self.forward_vf(self.X, self.vf_weights)
             pdparam = tf.concat([self.pi, self.pi * 0.0 + logstd], axis=1)
             self.pd = self.pdtype.pdfromflat(pdparam)
             a0 = self.pd.sample()
             neglogp0 = self.pd.neglogp(a0)
 
             def step(ob, sess, *_args, **_kwargs):
-                a, v, neglogp = sess.run([a0, self.vf, neglogp0], {X:ob})
+                a, v, neglogp = sess.run([a0, self.vf, neglogp0], {self.X:ob})
                 return a, v, self.initial_state, neglogp
 
             def value(ob, sess, *_args, **_kwargs):
-                return sess.run(self.vf, {X:ob})
+                return sess.run(self.vf, {self.X:ob})
             self.step = step
             self.value = value
 
@@ -48,17 +50,17 @@ class MlpPolicy(object):
 
     def assign_sampling_weights(self, new_weights, sess):
         if self.weight_placeholders == None:
-            print 'ERROR - this policy is not a sampling policy'
+            print('ERROR - this policy is not a sampling policy')
         feed_dict = {self.weight_placeholders[key]: new_weights[key] for key in new_weights}
         sess.run(self.assign_weight_ops, feed_dict)
 
-    def construct_policy_weights(self, scope):
+    def construct_policy_weights(self):
         """ construct symbolic weights for the policy"""
         init_scale = np.sqrt(2)
         get_var = tf.get_variable
 
-        with tf.variable_scope(scope, reuse=None):
-            w1 = get_var("w1", [self.X.get_shape()[1], 64], initializer=ortho_init(init_scale))
+        with tf.variable_scope('policy', reuse=None):
+            w1 = get_var("w1", [self.ob_shape[1], 64], initializer=ortho_init(init_scale))
             b1 = get_var("b1", [64], initializer=tf.constant_initializer(0.0))
             w2 = get_var("w2", [64, 64], initializer=ortho_init(init_scale))
             b2 = get_var("b2", [64], initializer=tf.constant_initializer(0.0))
@@ -68,16 +70,17 @@ class MlpPolicy(object):
             logstd = tf.get_variable(name="logstd", shape=[1, self.actdim],
                 initializer=tf.zeros_initializer())
         weights = {'w1': w1, 'b1': b1, 'w2': w2, 'b2': b2, 'w3': w3, 'b3': b3, 'logstd': logstd}
+        return weights
 
 
-    def construct_weights(self, scope):
+    def construct_weights(self):
         """ construct symbolic weights for the value function and policy"""
         init_scale = np.sqrt(2)
         get_var = tf.get_variable
 
         weights = self.construct_policy_weights()
-        with tf.variable_scope(scope, reuse=None):
-            vw1 = get_var("vw1", [self.X.get_shape()[1], 64], initializer=ortho_init(init_scale))
+        with tf.variable_scope('value_function', reuse=None):
+            vw1 = get_var("vw1", [self.ob_shape[1], 64], initializer=ortho_init(init_scale))
             vb1 = get_var("vb1", [64], initializer=tf.constant_initializer(0.0))
             vw2 = get_var("vw2", [64, 64], initializer=ortho_init(init_scale))
             vb2 = get_var("vb2", [64], initializer=tf.constant_initializer(0.0))
