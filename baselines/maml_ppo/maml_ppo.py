@@ -8,71 +8,137 @@ from baselines import logger
 from collections import deque
 from baselines.common import explained_variance
 
+from singletask_runner import SingleTaskRunner
+
 class Model(object):
-    def __init__(self, *, policy, ob_space, ac_space, nbatch_act, nbatch_train,
-                nsteps, ent_coef, vf_coef, max_grad_norm):
+    def __init__(self, *, policy, ob_space, ac_space, ntasks, nbatch_act, nbatch_train,
+                nsteps, ent_coef, max_grad_norm, inner_lr):
         sess = tf.get_default_session()
 
-        act_policy = policy(ob_space, ac_space, nenvs, 1)
+        act_policy = policy(ob_space, ac_space, nenvs, 1, sampling_pol=True)
         train_policy = policy(ob_space, ac_space, nbatch_train, nsteps)
 
+        # TODO - handle different batch sizes for inner and outer
+        ob_shape = (nbatch_train,) + ob_space.shape
+        TRAIN_X = tf.placeholder(tf.float32, ob_shape)
+        VAL_X = tf.placeholder(tf.float32, ob_shape)
         # actions
-        A = train_policy.pdtype.sample_placeholder([None])
+        TRAIN_A = train_policy.pdtype.sample_placeholder([None])
+        VAL_A = train_policy.pdtype.sample_placeholder([None])
         # advantages
-        ADV = tf.placeholder(tf.float32, [None])
-        # returns
-        R = tf.placeholder(tf.float32, [None])
+        TRAIN_ADV = tf.placeholder(tf.float32, [None])
+        VAL_ADV = tf.placeholder(tf.float32, [None])
+
         # old negative log PAC?
-        OLDNEGLOGPAC = tf.placeholder(tf.float32, [None])
-        # old predicted value
-        OLDVPRED = tf.placeholder(tf.float32, [None])
+        TRAIN_OLDNEGLOGPAC = tf.placeholder(tf.float32, [None])
+        VAL_OLDNEGLOGPAC = tf.placeholder(tf.float32, [None])
+
         # Adam learning rate
-        LR = tf.placeholder(tf.float32, [])
+        outer_LR = tf.placeholder(tf.float32, [])  # meta lr, beta
         CLIPRANGE = tf.placeholder(tf.float32, [])
 
-        neglogpac = train_policy.pd.neglogp(A)
-        entropy = tf.reduce_mean(train_policy.pd.entropy())
+        # pre-update policy
+        init_weights = train_policy.pol_weights
+        pre_pi, pre_logstd = train_policy.forward_pol(X, init_weights)
+        pre_pdparam = tf.concat([pre_pi, pre_pi * 0.0 + pre_logstd], axis=1)
+        pre_pd = train_policy.pdtype.pdfromflat(pdparam)
 
-        # forming the surrogate (?) objective loss
-        vpred = train_policy.vf
-        vpredclipped = OLDVPRED + tf.clip_by_value(train_policy.vf - OLDVPRED, - CLIPRANGE, CLIPRANGE)
-        vf_losses1 = tf.square(vpred - R)
-        vf_losses2 = tf.square(vpredclipped - R)
-        vf_loss = .5 * tf.reduce_mean(tf.maximum(vf_losses1, vf_losses2))
-        ratio = tf.exp(OLDNEGLOGPAC - neglogpac)
-        pg_losses = -ADV * ratio
-        pg_losses2 = -ADV * tf.clip_by_value(ratio, 1.0 - CLIPRANGE, 1.0 + CLIPRANGE)
-        pg_loss = tf.reduce_mean(tf.maximum(pg_losses, pg_losses2))
-        approxkl = .5 * tf.reduce_mean(tf.square(neglogpac - OLDNEGLOGPAC))
-        clipfrac = tf.reduce_mean(tf.to_float(tf.greater(tf.abs(ratio - 1.0), CLIPRANGE)))
-        loss = pg_loss - entropy * ent_coef + vf_loss * vf_coef
+        weight_keys = init_weights.keys()
+        init_weights_list = [init_weights[key] for key in weight_keys]
 
-        with tf.variable_scope('model'):
-            params = tf.trainable_variables()
-        grads = tf.gradients(loss, params)
+        def compute_task_policy(self, inp):
+            """ Compute the updated policy for a single task, analogous to task_metalearn
+                in the MAML supervised learning code. Also computes the outer gradient.
+            """
+            # unpack input:
+            T_X, T_A, T_ADV, T_OLDNEGLOGPAC, V_X, V_A, V_ADV, V_OLDNEGLOGPAC = inp
+
+            # TODO - Check the stuff below to update the policy. Math was made up.
+            # code for computing the updated policy weights for a single task starting from init_weights
+            train_neglogpac = pre_pd.neglogp(T_A)
+            ratio = tf.exp(T_OLDNEGLOGPAC - train_neglogpac)
+            pg_loss = tf.reduce_mean(-T_ADV * ratio)
+            inner_grad = tf.gradients(pg_loss, init_weights_list)
+
+            gradients = dict(zip(weights_keys, inner_grad))
+            # TODO - implement multiple gradient steps
+            task_weights = dict(zip(weights_keys, [init_weights[key] - inner_lr*gradients[key] for key in weights_keys]))
+
+            post_pi, post_logstd = train_policy.forward_pol(X, task_weights)
+            post_pdparam = tf.concat([post_pi, post_pi * 0.0 + post_logstd], axis=1)
+            post_pd = train_policy.pdtype.pdfromflat(pdparam)
+
+            # compute outer gradient
+            val_neglogpac = post_pd.neglogp(V_A)
+            ratio = tf.exp(V_OLDNEGLOGPAC - val_neglogpac)
+            pg_losses = -V_ADV * ratio
+            pg_losses2 = -V_ADV * tf.clip_by_value(ratio, 1.0 - CLIPRANGE, 1.0 + CLIPRANGE)
+            pg_loss = tf.reduce_mean(tf.maximum(pg_losses, pg_losses2))
+            approxkl = .5 * tf.reduce_mean(tf.square(val_neglogpac - V_OLDNEGLOGPAC))
+            clipfrac = tf.reduce_mean(tf.to_float(tf.greater(tf.abs(ratio - 1.0), CLIPRANGE)))
+            entropy = tf.reduce_mean(post_pd.entropy())
+            outer_loss = pg_loss - entropy * ent_coef
+            # TODO - make this the correct gradient by taking into account theta in the expectation.
+            outer_grad = tf.gradients(outer_loss, init_weights_list)
+
+            return task_weights, outer_grad, outer_loss, entropy, approxkl, clipfrac
+
+        out_dtype = [[tf.float32] * len(init_weights_list), [tf.float32] * len(init_weights_list), tf.float32, tf.float32, approxkl, clipfrac]
+        inp_packed = (TRAIN_X, TRAIN_A, TRAIN_ADV, TRAIN_OLDNEGLOGPAC,
+                VAL_X, VAL_A, VAL_ADV, VAL_OLDNEGLOGPAC)
+        result = tf.map_fn(compute_task_policy, elems=inp_packed, dtype=out_dtype, parallel_iterations=ntasks)
+        new_task_weights, outer_grads, losses, entropies, approxkls, clipfracs = result
+
+        outer_grads = [tf.reduce_mean(0, grad) for grad in outer_grads]
         if max_grad_norm is not None:
-            grads, _grad_norm = tf.clip_by_global_norm(grads, max_grad_norm)
-        grads = list(zip(grads, params))
-        trainer = tf.train.AdamOptimizer(learning_rate=LR, epsilon=1e-5)
+            grads, _grad_norm = tf.clip_by_global_norm(outer_grads, max_grad_norm)
+        grads = list(zip(grads, init_weights_list))
+        trainer = tf.train.AdamOptimizer(learning_rate=outer_LR, epsilon=1e-5)
         _train = trainer.apply_gradients(grads)
 
-        def train(lr, cliprange, obs, returns, masks, actions, values, neglogpacs, states=None):
+        pg_loss = tf.reduce_mean(losses)
+        entropy = tf.reduce_mean(entropies)
+        approxkl = tf.reduce_mean(approxkls)
+        clipfrac = tf.reduce_mean(clipfracs)
+
+        def get_preupdate_weights():
+            weights_list = sess.run(init_weights_list)
+            return dict(zip(weight_keys, weights_list))
+
+        def get_updated_weights(obs, returns, actions, values, neglogpacs):
+            """ Return list of weight matrices. """
             advs = returns - values
-            advs = (advs - advs.mean()) / (advs.std() + 1e-8)
-            td_map = {train_policy.X:obs, A:actions, ADV:advs, R:returns, LR:lr,
-                    CLIPRANGE:cliprange, OLDNEGLOGPAC:neglogpacs, OLDVPRED:values}
-            if states is not None:
-                td_map[train_policy.S] = states
-                td_map[train_policy.M] = masks
+            # TODO - should do the below on a per-task basis, make sure advs is numtasks x T
+            assert advs.shape[0] == ntasks and advs.shape[1] == nbatch_train
+            advs = (advs - advs.mean(avis=-1)) / (advs.std(axis=-1) + 1e-8)
+            td_map = {TRAIN_X:obs, TRAIN_A:actions, TRAIN_ADV:advs, TRAIN_OLDNEGLOGPAC:neglogpacs}
+            new_weights = sess.run(new_task_weights, td_map)
+            weight_dicts = []
+            for i in range(ntasks):
+                wlist = [w[i] for w in new_weights]
+                weight_dicts.append(dict(zip(weight_keys, wlist)))
+            return weight_dicts
+
+        def train(lr, cliprange, train_obs, train_returns, train_actions, train_values, train_neglogpacs
+                val_obs, val_returns, val_actions, val_values, val_neglogpacs):
+            # TODO - should do the below on a per-task basis, make sure advs is numtasks x T
+            assert advs.shape[0] == ntasks and advs.shape[1] == nbatch_train
+            train_advs = train_returns - train_values
+            train_advs = (train_advs - train_advs.mean(axis=-1)) / (train_advs.std(axis=-1) + 1e-8)
+            val_advs = val_returns - val_values
+            val_advs = (val_advs - val_advs.mean(axis=-1)) / (val_advs.std(axis=-1) + 1e-8)
+            td_map = {TRAIN_X:train_obs, TRAIN_A:actions, TRAIN_ADV:train_advs, outer_LR:lr,
+                    CLIPRANGE:cliprange, TRAIN_OLDNEGLOGPAC:train_neglogpacs,
+                    VAL_X: val_obs, VAL_A: val_actions, VAL_ADV: val_advs
+                    VAL_OLDNEGLOGPAC: val_neglogpacs}
             return sess.run(
-                [pg_loss, vf_loss, entropy, approxkl, clipfrac, _train],
-                td_map
-            )[:-1]
-        self.loss_names = ['policy_loss', 'value_loss', 'policy_entropy', 'approxkl', 'clipfrac']
+                [pg_loss, entropy, approxkl, clipfrac, _train], td_map
+                )[:-1]
+        self.loss_names = ['policy_loss', 'policy_entropy', 'approxkl', 'clipfrac']
 
         def save(save_path):
-            ps = sess.run(params)
-            joblib.dump(ps, save_path)
+            params = sess.run(init_weights)
+            joblib.dump(params, save_path)
 
         def load(load_path):
             loaded_params = joblib.load(load_path)
@@ -81,18 +147,11 @@ class Model(object):
                 restores.append(p.assign(loaded_p))
             sess.run(restores)
 
-        def get_preupdate_weights():
-            keys = train_policy.weights.keys()
-            weights_list = sess.run([train_policy.weights[key] for key in keys])
-            return dict(zip(keys, weights_list))
-
         self.train = train
         self.train_policy = train_policy
+        self.act_policy = act_policy
+        self.get_updated_weights = get_updated_weights
         self.get_preupdate_weights = get_preupdate_weights
-        self.act_model = act_model
-        #self.step = act_model.step
-        #self.value = act_model.value
-        #self.initial_state = act_model.initial_state
         self.save = save
         self.load = load
         tf.global_variables_initializer().run(session=sess) #pylint: disable=E1101
@@ -104,7 +163,7 @@ def constfn(val):
 
 
 def learn(*, policy, env, ntasks, nsteps, total_timesteps, ent_coef, lr, inner_lr,
-            vf_coef=0.5,  max_grad_norm=0.5, gamma=0.99, lam=0.95,
+            max_grad_norm=0.5, gamma=0.99, lam=0.95,
             log_interval=10, nminibatches=4, noptepochs=4, cliprange=0.2,
             save_interval=0):
     """ Run training.
@@ -132,17 +191,23 @@ def learn(*, policy, env, ntasks, nsteps, total_timesteps, ent_coef, lr, inner_l
     nbatch = nenvs * nsteps
     nbatch_train = nbatch // nminibatches
 
-    make_model = lambda : Model(policy=policy, ob_space=ob_space, ac_space=ac_space, ntasks=ntasks, nbatch_act=nenvs, nbatch_train=nbatch_train,
-                    nsteps=nsteps, ent_coef=ent_coef, vf_coef=vf_coef,
-                    max_grad_norm=max_grad_norm)
+    make_model = lambda : Model(policy=policy, ob_space=ob_space, ac_space=ac_space,
+            ntasks=ntasks, inner_lr=inner_lr, nbatch_act=nenvs, nbatch_train=nbatch_train,
+            nsteps=nsteps, ent_coef=ent_coef,
+            max_grad_norm=max_grad_norm)
     if save_interval and logger.get_dir():
         import cloudpickle
         with open(osp.join(logger.get_dir(), 'make_model.pkl'), 'wb') as fh:
             fh.write(cloudpickle.dumps(make_model))
-    model = make_model()
-    runners = [SingleTaskRunner.remote(env=env, policy=model.act_policy, nsteps=nsteps, gamma=gamma, lam=lam) for _ in range(ntasks)]
 
-    epinfobuf = deque(maxlen=100)
+    model = make_model()
+    # TODO - might be better to have the policy be constructed in the runner process...
+    # (i.e. ray might now allow passing the policy object into the constructor)
+    runners = [SingleTaskRunner.remote(env=env, policy=model.act_policy, nsteps=nsteps,
+        gamma=gamma, lam=lam, vf_lr=lr(1), max_grad_norm=max_grad_norm) for _ in range(ntasks)]
+
+    pre_epinfobuf = deque(maxlen=100)
+    post_epinfobuf = deque(maxlen=100)
     tfirststart = time.time()
 
     nupdates = total_timesteps//nbatch
@@ -155,22 +220,28 @@ def learn(*, policy, env, ntasks, nsteps, total_timesteps, ent_coef, lr, inner_l
         cliprangenow = cliprange(frac)
 
         for runner in runners:
+            # sample a new batch of tasks
             runner.reset_task.remote()
 
         # gather pre-update data
         preupdate_weights = model.get_preupdate_weights()
-        sampling_data = ray.get([runner.run.remote(preupdate_weights) for runner in runners])
+        pre_sampling_data = ray.get([runner.run.remote(preupdate_weights) for runner in runners])
 
-        # update policies here.
+        # invert list of lists and pack data of new inner list into first dim
+        pre_data = [ np.pack([task_data[i] for task_data in pre_sampling_data]) for i in len(pre_sampling_data) ]
+        pre_obs, pre_returns, _, pre_actions, pre_values, pre_neglogpacs, _, pre_epinfos = pre_data
 
+        # compute updated weights.
+        updated_weights = model.get_updated_weights(pre_obs, pre_returns, pre_masks,
+                                                    pre_actions, pre_values, pre_neglogpacs)
 
-        # gather pre-update data
+        # gather post-update data
+        post_sampling_data = ray.get([runner.run.remote(weights) for runner, weights in zip(runners, updated_weights)])
+        post_data = [ np.pack([task_data[i] for task_data in post_sampling_data]) for i in len(post_sampling_data) ]
+        post_obs, post_returns, _, post_actions, post_values, post_neglogpacs, _, post_epinfos = post_data
 
-
-
-
-        obs, returns, masks, actions, values, neglogpacs, states, epinfos = runner.run() #pylint: disable=E0632
-        epinfobuf.extend(epinfos)
+        pre_epinfobuf.extend(pre_epinfos)
+        post_epinfobuf.extend(post_epinfos)
         mblossvals = []
         if states is None: # nonrecurrent version
             inds = np.arange(nbatch)
@@ -179,24 +250,12 @@ def learn(*, policy, env, ntasks, nsteps, total_timesteps, ent_coef, lr, inner_l
                 for start in range(0, nbatch, nbatch_train):
                     end = start + nbatch_train
                     mbinds = inds[start:end]
-                    slices = (arr[mbinds] for arr in (obs, returns, masks, actions, values, neglogpacs))
+                    slices = (arr[mbinds] for arr in (pre_obs, pre_returns, pre_actions,
+                        pre_values, pre_neglogpacs, post_obs, post_returns, post_actions,
+                        post_values, post_neglogpacs))
                     mblossvals.append(model.train(lrnow, cliprangenow, *slices))
         else: # recurrent version
-            assert nenvs % nminibatches == 0
-            envsperbatch = nenvs // nminibatches
-            envinds = np.arange(nenvs)
-            flatinds = np.arange(nenvs * nsteps).reshape(nenvs, nsteps)
-            envsperbatch = nbatch_train // nsteps
-            for _ in range(noptepochs):
-                np.random.shuffle(envinds)
-                for start in range(0, nenvs, envsperbatch):
-                    end = start + envsperbatch
-                    mbenvinds = envinds[start:end]
-                    mbflatinds = flatinds[mbenvinds].ravel()
-                    slices = (arr[mbflatinds] for arr in (obs, returns, masks, actions, values, neglogpacs))
-                    mbstates = states[mbenvinds]
-                    mblossvals.append(model.train(lrnow, cliprangenow, *slices, mbstates))
-
+            raise NotImplementedError('Recurrence not currently supported with MAML')
         lossvals = np.mean(mblossvals, axis=0)
         tnow = time.time()
         fps = int(nbatch / (tnow - tstart))
@@ -207,8 +266,10 @@ def learn(*, policy, env, ntasks, nsteps, total_timesteps, ent_coef, lr, inner_l
             logger.logkv("total_timesteps", update*nbatch)
             logger.logkv("fps", fps)
             logger.logkv("explained_variance", float(ev))
-            logger.logkv('eprewmean', safemean([epinfo['r'] for epinfo in epinfobuf]))
-            logger.logkv('eplenmean', safemean([epinfo['l'] for epinfo in epinfobuf]))
+            logger.logkv('pre_eprewmean', safemean([epinfo['r'] for epinfo in pre_epinfobuf]))
+            logger.logkv('pre_eplenmean', safemean([epinfo['l'] for epinfo in pre_epinfobuf]))
+            logger.logkv('post_eprewmean', safemean([epinfo['r'] for epinfo in post_epinfobuf]))
+            logger.logkv('post_eplenmean', safemean([epinfo['l'] for epinfo in post_epinfobuf]))
             logger.logkv('time_elapsed', tnow - tfirststart)
             for (lossval, lossname) in zip(lossvals, model.loss_names):
                 logger.logkv(lossname, lossval)
