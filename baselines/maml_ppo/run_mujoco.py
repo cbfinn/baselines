@@ -32,7 +32,7 @@ def train(env_id, num_timesteps, seed):
         lam=0.95, gamma=0.99, noptepochs=10, log_interval=1, ent_coef=0.0,
         lr=3e-4, inner_lr=0.01,
         cliprange=0.2,
-        ntasks=4,
+        ntasks=40,
         total_timesteps=num_timesteps)
 
 

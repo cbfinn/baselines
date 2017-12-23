@@ -60,8 +60,11 @@ class Model(object):
 
             # code for computing the updated policy weights for a single task starting from init_weights
             train_neglogpac = pre_pd.neglogp(T_A)
-            ratio = tf.exp(T_OLDNEGLOGPAC - train_neglogpac)
-            pg_loss = tf.reduce_mean(-T_ADV * ratio)
+            #ratio = tf.exp(T_OLDNEGLOGPAC - train_neglogpac)
+            pg_loss = tf.reduce_mean(T_ADV * train_neglogpac)
+            # ppo update
+            #ratio = tf.exp(T_OLDNEGLOGPAC - train_neglogpac)
+            #pg_loss = tf.reduce_mean(-T_ADV * ratio)  # might need to remove reduce_mean
             # remove next two lines to not use clipping
             #pg_losses2 = -T_ADV * tf.clip_by_value(ratio, 1.0 - CLIPRANGE, 1.0 + CLIPRANGE)
             #pg_loss = tf.reduce_mean(tf.maximum(pg_loss, pg_losses2))
