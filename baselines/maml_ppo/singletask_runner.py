@@ -117,6 +117,7 @@ class SingleTaskRunner(object):
 
         last_values = self.policy.value(self.obs, self.sess)
         #discount/bootstrap off value fn
+        mb_raw_returns = mb_returns
         mb_returns = np.zeros_like(mb_rewards)
         mb_advs = np.zeros_like(mb_rewards)
         lastgaelam = 0
@@ -130,7 +131,7 @@ class SingleTaskRunner(object):
             delta = mb_rewards[t] + self.gamma * nextvalues * nextnonterminal - mb_values[t]
             mb_advs[t] = lastgaelam = delta + self.gamma * self.lam * nextnonterminal * lastgaelam
         mb_returns = mb_advs + mb_values
-        return (*map(sf01, (mb_obs, mb_returns, mb_actions, mb_values, mb_neglogpacs)),
+        return (*map(sf01, (mb_obs, mb_raw_returns, mb_returns, mb_actions, mb_values, mb_neglogpacs)),
             mb_states, epinfos)
 
 def sf01(arr):

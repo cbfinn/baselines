@@ -52,19 +52,23 @@ class MlpPolicy(object):
         if self.weight_placeholders == None:
             print('ERROR - this policy is not a sampling policy')
         feed_dict = {self.weight_placeholders[key]: new_weights[key] for key in new_weights}
+        #print('new weights: ' + str(new_weights['logstd']))
+        #print('before: ' + str(sess.run(self.pol_weights['logstd'])))
         sess.run(self.assign_weight_ops, feed_dict)
+        #print('after: ' + str(sess.run(self.pol_weights['logstd'])))
 
     def construct_policy_weights(self):
         """ construct symbolic weights for the policy"""
         init_scale = np.sqrt(2)
         get_var = tf.get_variable
+        dim_hidden = 100 # 64
 
         with tf.variable_scope('policy', reuse=None):
-            w1 = get_var("w1", [self.ob_shape[1], 64], initializer=ortho_init(init_scale))
-            b1 = get_var("b1", [64], initializer=tf.constant_initializer(0.0))
-            w2 = get_var("w2", [64, 64], initializer=ortho_init(init_scale))
-            b2 = get_var("b2", [64], initializer=tf.constant_initializer(0.0))
-            w3 = get_var("w3", [64, self.actdim], initializer=ortho_init(0.01))
+            w1 = get_var("w1", [self.ob_shape[1], dim_hidden], initializer=ortho_init(init_scale))
+            b1 = get_var("b1", [dim_hidden], initializer=tf.constant_initializer(0.0))
+            w2 = get_var("w2", [dim_hidden, dim_hidden], initializer=ortho_init(init_scale))
+            b2 = get_var("b2", [dim_hidden], initializer=tf.constant_initializer(0.0))
+            w3 = get_var("w3", [dim_hidden, self.actdim], initializer=ortho_init(0.01))
             b3 = get_var("b3", [self.actdim], initializer=tf.constant_initializer(0.0))
 
             logstd = tf.get_variable(name="logstd", shape=[1, self.actdim],
@@ -92,7 +96,7 @@ class MlpPolicy(object):
 
     def forward_pol(self, inp, weights):
         """ symbolic forward pass through both policy and value function """
-        act = tf.tanh
+        act = tf.nn.relu #tf.tanh
 
         z = tf.matmul(inp, weights['w1']) + weights['b1']
         h = act(z)

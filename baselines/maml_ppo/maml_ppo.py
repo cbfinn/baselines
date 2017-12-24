@@ -213,14 +213,9 @@ def learn(*, policy, get_env, ntasks, nsteps, total_timesteps, ent_coef, lr, inn
             fh.write(cloudpickle.dumps(make_model))
 
     model = make_model()
-    # TODO - might be better to have the policy be constructed in the runner process...
-    # (i.e. ray might now allow passing the policy object into the constructor)
     runners = [SingleTaskRunner.remote(get_env, model.make_act_policy, nsteps,
         gamma, lam, vf_lr=lr(1), max_grad_norm=max_grad_norm, noptepochs=noptepochs,
         nbatch_train=nbatch_train, nbatch=nbatch) for _ in range(ntasks)]
-    #runners = [SingleTaskRunner(env=env, policy=model.make_act_policy, nsteps=nsteps,
-    #    gamma=gamma, lam=lam, vf_lr=lr(1), max_grad_norm=max_grad_norm, noptepochs=noptepochs,
-    #    nbatch_train=nbatch_train, nbatch=nbatch) for _ in range(ntasks)]
 
     pre_epinfobuf = deque(maxlen=100)
     post_epinfobuf = deque(maxlen=100)
@@ -244,11 +239,10 @@ def learn(*, policy, get_env, ntasks, nsteps, total_timesteps, ent_coef, lr, inn
         pre_sampling_data = ray.get([runner.run.remote(preupdate_weights) for runner in runners])
         diff = time.time() - t0
         print('Pre sampling time: ' + str(diff))
-        #pre_sampling_data = [runner.run(preupdate_weights) for runner in runners]
 
         # invert list of lists and pack data of new inner list into first dim
         pre_data = [ np.array([task_data[i] for task_data in pre_sampling_data]) for i in range(len(pre_sampling_data[0])) ]
-        pre_obs, pre_returns, pre_actions, pre_values, pre_neglogpacs, _, pre_epinfos = pre_data
+        pre_obs, pre_raw_returns, pre_returns, pre_actions, pre_values, pre_neglogpacs, _, pre_epinfos = pre_data
 
         # compute updated weights.
         t0 = time.time()
@@ -260,9 +254,8 @@ def learn(*, policy, get_env, ntasks, nsteps, total_timesteps, ent_coef, lr, inn
         # gather post-update data
         t0 = time.time()
         post_sampling_data = ray.get([runner.run.remote(weights) for runner, weights in zip(runners, updated_weights)])
-        #post_sampling_data = [runner.run(weights) for runner, weights in zip(runners, updated_weights)]
         post_data = [ np.array([task_data[i] for task_data in post_sampling_data]) for i in range(len(post_sampling_data[0])) ]
-        post_obs, post_returns, post_actions, post_values, post_neglogpacs, _, post_epinfos = post_data
+        post_obs, post_raw_returns, post_returns, post_actions, post_values, post_neglogpacs, _, post_epinfos = post_data
 
         diff1 = time.time() - t0
         print("Post sampling time: " + str(diff1))

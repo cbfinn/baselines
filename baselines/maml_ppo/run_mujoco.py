@@ -28,11 +28,11 @@ def train(env_id, num_timesteps, seed):
     set_global_seeds(seed)
     policy = MlpPolicy
     ray.init()
-    maml_ppo.learn(policy=policy, get_env=get_env, nsteps=2048, nminibatches=64,
+    maml_ppo.learn(policy=policy, get_env=get_env, nminibatches=64, nsteps=2048, #2048, #2048,
         lam=0.95, gamma=0.99, noptepochs=10, log_interval=1, ent_coef=0.0,
-        lr=3e-4, inner_lr=0.01,
+        lr=3e-4, inner_lr=0.1,
         cliprange=0.2,
-        ntasks=40,
+        ntasks=20,
         total_timesteps=num_timesteps)
 
 
